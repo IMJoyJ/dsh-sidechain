@@ -14,7 +14,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {
   ContinuableStart,
   ContinuableStartSpec,
-  SubagentListEntry,
+  SubagentCatalogEntry,
   SubagentRun,
   SubagentStartRequest,
 } from '@deepseek-ai/dsh-subagent'
@@ -98,21 +98,17 @@ function runOf(result: Promise<unknown> = new Promise<never>(() => {})): Subagen
   } as unknown as SubagentRun
 }
 
-type ChildEntry = Extract<SubagentListEntry, { kind: 'child' }>
-
-function childEntry(partial: Partial<ChildEntry> = {}): SubagentListEntry {
+function childEntry(partial: Partial<SubagentCatalogEntry> & { id?: SessionId } = {}): SubagentCatalogEntry {
   const mode = partial.mode ?? 'continuable'
   const label = (partial as { label?: string }).label
   return {
-    kind: 'child',
     id: partial.id ?? CHILD_ID,
-    activity: partial.activity ?? 'inactive',
-    hasChildren: partial.hasChildren ?? false,
+    createdAt: 0,
     mode,
     ...(mode === 'continuable'
       ? { label: label ?? 'Side conversation' }
       : label === undefined ? {} : { label }),
-  } as SubagentListEntry
+  } as SubagentCatalogEntry
 }
 
 describe('pinned prompt text', () => {
@@ -139,8 +135,8 @@ describe('pinned prompt text', () => {
 describe('command registration', () => {
   it('declares argument hints and keeps both questions out of the parent log', () => {
     const { commands } = makeHarness()
-    expect(commands[0]?.input).toEqual({ hint: '<question>', images: true })
-    expect(commands[1]?.input).toEqual({ hint: '<question>', images: true })
+    expect(commands[0]?.input).toEqual({ hint: '<question>', attachments: true })
+    expect(commands[1]?.input).toEqual({ hint: '<question>', attachments: true })
     expect(commands[0]?.recordInput).toBe(false)
     expect(commands[1]?.recordInput).toBe(false)
   })
@@ -286,9 +282,9 @@ describe('/side (continuable side thread)', () => {
   it('lists children of the current session through /side list', async () => {
     const { subagents, commands } = makeHarness()
     subagents.listChildren.mockResolvedValue([
-      childEntry({ activity: 'running', label: 'seams research' }),
+      childEntry({ mode: 'continuable', label: 'seams research' }),
       childEntry({ mode: 'one-shot', label: 'BTW: quick check' }),
-      { kind: 'diagnostic', id: 'child-3' as SessionId, reason: 'corrupt' },
+      childEntry({ id: 'child-3' as SessionId, mode: 'unknown' }),
     ])
 
     const result = await invoke(commands[0]!, 'list')
@@ -296,9 +292,9 @@ describe('/side (continuable side thread)', () => {
     expect(subagents.listChildren).toHaveBeenCalledWith(PARENT_ID, expect.any(AbortSignal))
     expect(result.kind).toBe('success')
     const text = result.kind === 'success' ? result.text : ''
-    expect(text).toContain('[side/running] seams research')
-    expect(text).toContain('[btw/inactive] BTW: quick check')
-    expect(text).toContain('[unavailable] child-3 (corrupt)')
+    expect(text).toContain('[side] seams research')
+    expect(text).toContain('[btw] BTW: quick check')
+    expect(text).toContain('[?] child-3')
   })
 
   it('reports an empty catalog', async () => {
@@ -323,9 +319,11 @@ describe('text helpers', () => {
     const text = formatSideList([
       childEntry({ mode: 'one-shot' }),
       childEntry({ mode: 'continuable', label: 'named side' }),
+      childEntry({ id: 'child-x' as SessionId, mode: 'unknown' }),
     ])
-    expect(text).toContain('[btw/inactive] (one-shot)')
-    expect(text).toContain('[side/inactive] named side')
+    expect(text).toContain('[btw] (one-shot)')
+    expect(text).toContain('[side] named side')
+    expect(text).toContain('[?] child-x')
   })
 })
 

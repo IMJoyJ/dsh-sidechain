@@ -14,8 +14,8 @@
  * with a shimmer sweep on the running label (installed once via
  * panel-style.ts, reduced-motion safe).
  *
- * Data rides the alpha Session Controller's live subagent catalog —
- * `sessions.list` rows under `subagentsByParent` — for membership, and Session
+ * Data rides the Session Controller's live subagent catalog projection —
+ * `sessions.list` rows under `projectionsBySession` — for membership, and Session
  * Remote history for conversation content (no activation, no navigation).
  * While the selected child is running, a poll reads its transcript tail (the
  * host serves the live child's in-memory snapshot) and the transcript layer
@@ -45,14 +45,16 @@ import type {
   CommandNode, ChatNode,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {
-  SessionListState, SessionSummary, SubagentCatalogSnapshot,
+  SessionSummary,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { SubagentAddress } from '@deepseek-ai/dsh-subagent/client'
+import type { SubagentAddress, SubagentCatalogEntry } from '@deepseek-ai/dsh-subagent/client'
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
 import {
-  DisclosureRow, IconBranchOutline16, IconBrowseOutline16, IconChevronLeftOutline14, IconCloseOutline16,
-  IconFullscreenOutline16, IconRefreshOutline14, IconRightUpOutline14, MarkdownText, StateDot,
-  IconThinkOutline14,
+  DisclosureRow, IconBranchOutlineRegular, IconBrowseOutlineRegular, IconChevronLeftOutlineRegular, IconCloseOutlineRegular,
+  IconFullscreenOutlineRegular, IconRefreshOutlineRegular, IconRightUpOutlineRegular, MarkdownText, StateDot,
+  IconThinkOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MarkdownCodeLabels, MarkdownFileMentions } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
@@ -80,10 +82,8 @@ export interface SidechainPanelInjected {
   readActivity(address: SubagentAddress): Promise<string | null>
   /** Deliver one human message to a continuable child. */
   sendPrompt(address: Extract<SubagentAddress, { mode: 'continuable' }>, text: string): Promise<boolean>
-  /** Trigger a fresh catalog fetch for the parent session. */
+  /** Trigger a fresh projection (catalog) fetch for the parent session. */
   refresh(parentSessionId: SessionId): void
-  /** Arm (true) or disarm (false) the live catalog membership feed. */
-  setCatalogOpen(parentSessionId: SessionId, open: boolean): void
   /** Open an absolute path through the Session Controller. */
   openPath(path: string): void
 }
@@ -115,20 +115,34 @@ export type SidechainRow =
   }
 
 /**
+ * One resolved catalog entry: the durable projection row plus liveness
+ * derived from the status feed and session summaries (the 0.1.7 catalog
+ * projection carries no activity of its own).
+ */
+export interface SidechainCatalogEntry {
+  id: SessionId
+  mode: 'one-shot' | 'continuable' | 'unknown'
+  label?: string | undefined
+  activity: 'running' | 'inactive'
+}
+
+/**
  * Resolve the catalog into display rows: child entries carry their durable
  * label when present, falling back to the session title and then id.
- * @param catalog - the parent's catalog snapshot (absent while never fetched).
+ * Unknown-mode entries surface as `unsupported` diagnostics, matching the
+ * runtime's own treatment of unreadable catalog modes.
+ * @param entries - the parent's resolved catalog entries (absent while never fetched).
  * @param summaries - session list rows, used as the label fallback source.
  * @returns flat display rows in catalog order.
  */
 export function sidechainRows(
-  catalog: SubagentCatalogSnapshot | undefined,
+  entries: readonly SidechainCatalogEntry[] | undefined,
   summaries: Readonly<Record<SessionId, SessionSummary>>,
 ): SidechainRow[] {
-  if (catalog === undefined) return []
-  return catalog.entries.map((entry): SidechainRow => {
-    if (entry.kind === 'diagnostic') {
-      return { kind: 'diagnostic', id: entry.id, reason: entry.reason }
+  if (entries === undefined) return []
+  return entries.map((entry): SidechainRow => {
+    if (entry.mode === 'unknown') {
+      return { kind: 'diagnostic', id: entry.id, reason: 'unsupported' }
     }
     return {
       kind: 'child',
@@ -138,6 +152,24 @@ export function sidechainRows(
       label: entry.label ?? summaries[entry.id]?.title ?? entry.id,
     }
   })
+}
+
+/**
+ * Resolve durable catalog projection rows into panel entries, deriving
+ * liveness the way the runtime's own subagent lineage does: the status
+ * feed wins, the session summary's running bit is the fallback.
+ */
+export function resolveCatalogEntries(
+  catalog: readonly SubagentCatalogEntry[] | undefined,
+  isRunning: (id: SessionId) => boolean,
+): SidechainCatalogEntry[] {
+  if (catalog === undefined) return []
+  return catalog.map((entry) => ({
+    id: entry.id,
+    mode: entry.mode,
+    ...(entry.label === undefined ? {} : { label: entry.label }),
+    activity: isRunning(entry.id) ? 'running' as const : 'inactive' as const,
+  }))
 }
 
 /** Number of child rows currently running (the header badge value). */
@@ -464,7 +496,7 @@ function TranscriptDisclosure({ row, streaming, t }: {
   const contextSource = row.kind === 'context' ? row.source : null
   return (
     <DisclosureRow
-      icon={row.kind === 'reasoning' ? <IconThinkOutline14 /> : <IconBrowseOutline16 size={14} />}
+      icon={row.kind === 'reasoning' ? <IconThinkOutlineRegular /> : <IconBrowseOutlineRegular size={14} />}
       title={row.kind === 'reasoning'
         ? t('view.reasoning')
         : t(row.recall ? 'view.contextRecall' : 'view.context')}
@@ -562,12 +594,17 @@ const ACTIVITY_POLL_INTERVAL_MS = 3000
  * separate from the panel host lets blank sessions mount the host even while
  * their header chrome is intentionally absent.
  */
-export function SidechainPanelToggle({ sessionId, useSessions, t }: SidechainPanelToggleProps): JSX.Element {
+export function SidechainPanelToggle({ sessionId, useSessions, useSessionStatus, t }: SidechainPanelToggleProps): JSX.Element {
   const [open, setOpen] = useState(isSidechainPanelOpen)
   useEffect(() => subscribeSidechainPanel(() => { setOpen(isSidechainPanelOpen()) }), [])
-  const catalog = useSessions(state => state.subagentsByParent[sessionId])
+  const projections = useSessions(state => state.projectionsBySession)
   const summaries = useSessions(state => state.byId)
-  const running = runningCount(sidechainRows(catalog, summaries))
+  const statuses = useSessionStatus(value => value)
+  const rows = sidechainRows(resolveCatalogEntries(
+    projections[sessionId]?.values.subagentCatalog,
+    (id) => (statuses.get(id)?.running ?? summaries[id]?.running) === true,
+  ), summaries)
+  const running = runningCount(rows)
   return (
     <button
       type="button"
@@ -577,7 +614,7 @@ export function SidechainPanelToggle({ sessionId, useSessions, t }: SidechainPan
       aria-pressed={open}
       onClick={toggleSidechainPanel}
     >
-      <IconBranchOutline16 />
+      <IconBranchOutlineRegular />
       {running > 0 && <span style={styles.badge}>{running}</span>}
     </button>
   )
@@ -586,11 +623,11 @@ export function SidechainPanelToggle({ sessionId, useSessions, t }: SidechainPan
 /**
  * The composer-mounted floating right panel. It shows the catalog list or,
  * once selected, the child's embedded conversation (transcript + composer for continuable
- * threads); the main session never switches. Arming the catalog happens on
- * open and follows the current session.
+ * threads); the main session never switches. The catalog projection refreshes
+ * on open and follows the current session.
  */
 export function SidechainPanel({
-  sessionId, useChat, useSessions, readTranscript, readActivity, sendPrompt, refresh, setCatalogOpen, openPath, t,
+  sessionId, useChat, useSessions, useSessionStatus, readTranscript, readActivity, sendPrompt, refresh, openPath, t,
 }: SidechainPanelProps): JSX.Element {
   const [open, setOpen] = useState(isSidechainPanelOpen)
   const [selected, setSelected] = useState(selectedChildId)
@@ -662,10 +699,14 @@ export function SidechainPanel({
     }
   }, [commands, sessionId])
 
-  const catalogs = useSessions(state => state.subagentsByParent)
+  const projections = useSessions(state => state.projectionsBySession)
   const summaries = useSessions(state => state.byId)
-  const catalog = catalogs[sessionId]
-  const rows = useMemo(() => sidechainRows(catalog, summaries), [catalog, summaries])
+  const statuses = useSessionStatus(value => value)
+  const projection = projections[sessionId]
+  const rows = useMemo(() => sidechainRows(resolveCatalogEntries(
+    projection?.values.subagentCatalog,
+    (id) => (statuses.get(id)?.running ?? summaries[id]?.running) === true,
+  ), summaries), [projection, statuses, summaries])
   const running = runningCount(rows)
   // Stable reference: MarkdownText bakes codeLabels into its streaming cache
   // and discards the cache when the reference changes (see its module doc).
@@ -673,17 +714,14 @@ export function SidechainPanel({
 
   // The injected actions can be recreated per render; keep effects pinned to
   // stable keys, reading the latest actions through a ref.
-  const actionsRef = useRef({ readTranscript, readActivity, sendPrompt, refresh, setCatalogOpen })
-  actionsRef.current = { readTranscript, readActivity, sendPrompt, refresh, setCatalogOpen }
+  const actionsRef = useRef({ readTranscript, readActivity, sendPrompt, refresh })
+  actionsRef.current = { readTranscript, readActivity, sendPrompt, refresh }
 
-  // Arm the catalog feed and refresh while open; disarm on close or when the
-  // panel moves to another session (the cleanup runs with the old session id).
+  // Refresh the catalog projection while open; the runtime also pushes
+  // projection updates over the control stream, so no arming call is needed.
   useEffect(() => {
     if (!open) return
-    const { refresh, setCatalogOpen } = actionsRef.current
-    setCatalogOpen(sessionId, true)
-    refresh(sessionId)
-    return () => { actionsRef.current.setCatalogOpen(sessionId, false) }
+    actionsRef.current.refresh(sessionId)
   }, [open, sessionId])
 
   // Keep the catalog live even if the runtime's automatic subagent events do
@@ -813,7 +851,7 @@ export function SidechainPanel({
   // is intentionally NOT used to infer activity.
   const summaryRunning = selected === undefined ? undefined : summaries[selected]?.running
   const selectedActivity: ChildActivity = resolveChildActivity({
-    catalogState: catalog?.state ?? 'absent',
+    catalogState: projection?.state ?? 'absent',
     catalogActivity: selectedChild?.activity,
     summaryRunning,
   })
@@ -1042,9 +1080,10 @@ export function SidechainPanel({
     request(target, false)
   }, [draft, request])
 
-  const loading = catalog === undefined
-    || (catalog.state === 'loading' && rows.length === 0)
-  const empty = catalog !== undefined && catalog.state === 'ready' && rows.length === 0
+  const projectionState = projection?.state ?? 'absent'
+  const loading = projection === undefined
+    || (projection.state === 'loading' && rows.length === 0)
+  const empty = projection !== undefined && projection.state === 'ready' && rows.length === 0
 
   const panelTransform = entered ? 'translateX(0)' : 'translateX(100%)'
   const panelOpacity = entered ? 1 : 0
@@ -1077,7 +1116,7 @@ export function SidechainPanel({
                 title={t('view.back')}
                 onClick={() => { actionsRef.current.refresh(sessionId); selectChild(undefined) }}
               >
-                <IconChevronLeftOutline14 />
+                <IconChevronLeftOutlineRegular />
                 {t('view.back')}
               </button>
             )}
@@ -1092,7 +1131,7 @@ export function SidechainPanel({
               aria-pressed={expanded}
               onClick={toggleExpanded}
             >
-              <IconFullscreenOutline16 />
+              <IconFullscreenOutlineRegular />
             </button>
             <button
               type="button"
@@ -1107,7 +1146,7 @@ export function SidechainPanel({
                 }
               }}
             >
-              <IconRefreshOutline14 />
+              <IconRefreshOutlineRegular />
             </button>
             <button
               type="button"
@@ -1116,12 +1155,12 @@ export function SidechainPanel({
               aria-label={t('panel.close')}
               onClick={closeSidechainPanel}
             >
-              <IconCloseOutline16 />
+              <IconCloseOutlineRegular />
             </button>
           </div>
           {address === undefined ? (
             <div style={styles.body}>
-              {catalog !== undefined && catalog.state === 'error' && (
+              {projectionState === 'error' && (
                 <div style={styles.error}>
                   <span>{t('panel.error')}</span>
                   <button
@@ -1209,7 +1248,7 @@ export function SidechainPanel({
                     onChange={(event) => { setDraft(event.target.value) }}
                   />
                   <button type="submit" style={styles.sendButton} aria-label={t('composer.send')}>
-                    <IconRightUpOutline14 />
+                    <IconRightUpOutlineRegular />
                   </button>
                 </form>
               )}

@@ -81,6 +81,31 @@ describe('createSettlementSilence', () => {
     expect(parent.delivered).toEqual([])
   })
 
+  it('drops a 0.1.7 child report delivered as agent-message', () => {
+    const { silence } = setup()
+    const parent = fakeAgent()
+    silence.noteChild(parent, SIDE)
+    parent.steer({
+      role: 'user',
+      content: [{ type: 'text', text: 'Agent child-9 sent a message: done' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: SIDE },
+    } as unknown as UserMessage)
+    expect(parent.delivered).toEqual([])
+  })
+
+  it('passes agent-messages from unregistered children', () => {
+    const { silence } = setup()
+    const parent = fakeAgent()
+    silence.noteChild(parent, SIDE)
+    const foreign = {
+      role: 'user',
+      content: [{ type: 'text', text: 'other workflow' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: OTHER },
+    } as unknown as UserMessage
+    parent.followup(foreign)
+    expect(parent.delivered).toEqual([{ method: 'followup', message: foreign }])
+  })
+
   it('passes ordinary messages and notices from unregistered children', () => {
     const { silence } = setup()
     const parent = fakeAgent()

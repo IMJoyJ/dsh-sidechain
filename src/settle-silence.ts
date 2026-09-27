@@ -1,9 +1,11 @@
 /**
  * Stop side-conversation reports and settlement notices before they enter the
- * parent inbox. Continuable children can deliver both `subagent-report` and
- * `subagent-settled` messages through `followup`, `steer`, or `inject`; even
+ * parent inbox. Continuable children can deliver both explicit reports and
+ * settlement notices through `followup`, `steer`, or `inject`; even
  * filtering later at pre-step leaves inbox and empty-turn events in the main
- * Session log.
+ * Session log. The explicit-report kind is host-versioned (`subagent-report`
+ * before 0.1.7, `agent-message` after); the settlement kind
+ * (`subagent-settled`) is matched on both.
  *
  * Child identity is persisted under DSH_HOME so resumed parents still reject
  * authored reports and settlement notices from side children created before a
@@ -67,7 +69,7 @@ interface SettlementSource {
 
 function isSideChildDelivery(message: UserMessage, children: ReadonlySet<SessionId>): boolean {
   const source = message.source as SettlementSource | undefined
-  return (source?.kind === 'subagent-report' || source?.kind === 'subagent-settled')
+  return (source?.kind === 'subagent-report' || source?.kind === 'subagent-settled' || source?.kind === 'agent-message')
     && source.senderSessionId !== undefined
     && children.has(source.senderSessionId as SessionId)
 }
@@ -99,7 +101,7 @@ export function createSettlementSilence(ctx: Context): SettlementSilence {
 
   // Protect live parents on hot load and future parents after a cold restart.
   for (const agent of ctx.agents.list()) protect(agent)
-  const removeCreatedListener = ctx.on('agent/created', ({ agent }) => { protect(agent) })
+  const removeCreatedListener = ctx.on('agent/created', ({ agent }) => { protect(agent); return undefined })
 
   return {
     reserveChild(parent): SessionId {

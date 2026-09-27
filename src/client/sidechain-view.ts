@@ -9,19 +9,17 @@
  * before the first "Side conversation boundary" prompt and its preceding
  * seed marker, so continuation-turn seed markers do not hide older turns.
  *
- * Live streaming: `assistant/message` events only land when a step completes,
- * but `assistant/chunk` events stream token-level text and reasoning deltas.
- * The mapping accumulates both per block and supersedes them with the
- * assembled message once it lands. Tail polls merge into a per-child event
- * cache, so old rounds remain visible without re-reading the inherited seed.
+ * Live streaming: `assistant/message` events land when a step completes
+ * (token-level chunks are no longer durable log events, so there is no
+ * per-token accumulation — each assembled message renders its own rows).
+ * Tail polls merge into a per-child event cache, so old rounds remain visible without re-reading the inherited seed.
  */
 
 import type { SessionRemote } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionAddress, SessionFollowFrame, SessionHistoryRecord } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
-import { decodeStorageRecord } from '@deepseek-ai/dsh-session/chunk-rows'
-import type { SubagentAddress, SubagentPromptRequestId } from '@deepseek-ai/dsh-subagent/client'
+import type { SubagentAddress, SubagentPromptRequest, SubagentPromptRequestId } from '@deepseek-ai/dsh-subagent/client'
 import { lastActivity } from './sidechain-activity.ts'
 
 /**
@@ -143,10 +141,10 @@ function transcriptSeedEnd(events: readonly SessionEvent[]): number {
 /**
  * Map a session log's history rows onto compact transcript rows: the
  * inherited fork seed is cut at the first boundary's preceding
- * `session/end-seed`, the boundary prompt is dropped, `assistant/chunk` text deltas accumulate into a
- * streaming row per step (superseded by the assembled `assistant/message`),
- * and tool invocations render one expandable line each — raw arguments and
- * paired result content ride the row as detail; a failing `tool/result` marks it.
+ * `session/end-seed`, the boundary prompt is dropped, each assembled
+ * `assistant/message` renders its own rows, and tool invocations render one
+ * expandable line each — raw arguments and paired result content ride the row
+ * as detail; a failing `tool/result` marks it.
  * @param entries - expanded alpha history events in seq order.
  * @returns display rows in log order.
  */
@@ -154,8 +152,6 @@ export function transcriptRows(entries: readonly TranscriptEntry[]): TranscriptR
   const events = entries.map(entry => entry.event)
   const seedEnd = transcriptSeedEnd(events)
   const rows: TranscriptRow[] = []
-  /** (turn, step, block, kind) key → index of its accumulating stream row. */
-  const streamRows = new Map<string, number>()
   /** tool callId → index of its tool row in `rows` (result pairing). */
   const callRows = new Map<string, number>()
   for (let i = 0; i < events.length; i++) {
@@ -185,31 +181,7 @@ export function transcriptRows(entries: readonly TranscriptEntry[]): TranscriptR
         }
         break
       }
-      case 'assistant/chunk': {
-        const chunk = event.data.chunk
-        if ((chunk.type !== 'text-delta' && chunk.type !== 'reasoning-delta') || chunk.text === '') break
-        const kind = chunk.type === 'text-delta' ? 'assistant' : 'reasoning'
-        const key = `${event.data.turn}:${event.data.step}:${chunk.index}:${kind}`
-        const existing = streamRows.get(key)
-        if (existing !== undefined) {
-          const row = rows[existing]
-          if (row !== undefined && row.kind === kind) {
-            rows[existing] = { ...row, text: row.text + chunk.text }
-          }
-        } else {
-          streamRows.set(key, rows.length)
-          rows.push({ kind, seq: event.seq, text: chunk.text })
-        }
-        break
-      }
       case 'assistant/message': {
-        const prefix = `${event.data.turn}:${event.data.step}:`
-        const streamed = [...streamRows.entries()]
-          .filter(([key]) => key.startsWith(prefix))
-          .map(([, index]) => index)
-        for (const key of [...streamRows.keys()]) {
-          if (key.startsWith(prefix)) streamRows.delete(key)
-        }
         const settled = event.data.message.content.flatMap((block): TranscriptRow[] => {
           if (block.type === 'reasoning' && block.text !== '') {
             return [{ kind: 'reasoning', seq: event.seq, text: block.text }]
@@ -233,8 +205,7 @@ export function transcriptRows(entries: readonly TranscriptEntry[]): TranscriptR
         if (settled.length === 0 && event.data.message.content.length === 0) {
           settled.push({ kind: 'assistant', seq: event.seq, text: '…' })
         }
-        if (streamed.length === 0) rows.push(...settled)
-        else rows.splice(Math.min(...streamed), streamed.length, ...settled)
+        rows.push(...settled)
         break
       }
       case 'tool/call': {
@@ -253,13 +224,12 @@ export function transcriptRows(entries: readonly TranscriptEntry[]): TranscriptR
       }
       case 'tool/result': {
         const data = event.data
-        const resultBlock = data.message.content[0]
-        const callId = resultBlock?.toolCallId
-        const index = callId === undefined ? undefined : callRows.get(callId)
+        const callId = data.message.toolCallId
+        const index = callRows.get(callId)
         const error = data.error
-        // A result is failed on the explicit event error OR the block's own
+        // A result is failed on the explicit event error OR the message's own
         // isError flag (tools report hard failures either way).
-        const failed = error !== undefined || resultBlock?.isError === true
+        const failed = error !== undefined || data.message.isError === true
         if (index !== undefined) {
           const row = rows[index]
           if (row !== undefined && row.kind === 'tool') {
@@ -268,7 +238,7 @@ export function transcriptRows(entries: readonly TranscriptEntry[]): TranscriptR
               failed,
               detail: {
                 ...row.detail,
-                ...(resultBlock?.content.length === 0 ? {} : { result: resultBlock?.content }),
+                ...(data.message.content.length === 0 ? {} : { result: data.message.content }),
                 ...(data.meta === undefined ? {} : { meta: data.meta }),
                 ...(error === undefined ? {} : { error }),
               },
@@ -323,10 +293,8 @@ export function producedPaths(entries: readonly TranscriptEntry[]): string[] {
   for (let i = seedEnd + 1; i < entries.length; i++) {
     const event = entries[i]?.event
     if (event === undefined || event.type !== 'tool/result') continue
-    const block = event.data.message.content[0]
-    const callId = block?.toolCallId
-    if (callId === undefined) continue
-    if (event.data.error !== undefined || block?.isError === true) failedCallIds.add(callId)
+    const callId = event.data.message.toolCallId
+    if (event.data.error !== undefined || event.data.message.isError === true) failedCallIds.add(callId)
   }
   const paths: string[] = []
   const seen = new Set<string>()
@@ -593,25 +561,9 @@ async function fetchSeedCutEntries(
   return collected
 }
 
-/** Expand alpha's packed history rows at the Remote boundary. */
+/** Expand alpha's history rows at the Remote boundary. */
 function expandHistoryRecords(records: readonly SessionHistoryRecord[]): TranscriptEntry[] {
-  const entries: TranscriptEntry[] = []
-  for (const record of records) {
-    if (record.type === 'event') {
-      entries.push({ event: record.event as unknown as SessionEvent })
-      continue
-    }
-    const packed = record.event
-    const type = packed.type.replace('chunkrow/', '')
-    const decoded = decodeStorageRecord({
-      type,
-      seq0: packed.seq,
-      time0: packed.time,
-      data: packed.data,
-    })
-    entries.push(...decoded.map(event => ({ event })))
-  }
-  return entries
+  return records.map(record => ({ event: record.event as unknown as SessionEvent }))
 }
 
 /**
@@ -624,13 +576,7 @@ function expandHistoryRecords(records: readonly SessionHistoryRecord[]): Transcr
  * @returns whether the prompt was accepted.
  */
 export async function sendPrompt(
-  subagents: { prompt: (request: {
-    requestId: SubagentPromptRequestId
-    parentSessionId: SubagentAddress['parentSessionId']
-    childSessionId: SubagentAddress['childSessionId']
-    mode: 'continuable'
-    content: ContentBlock[]
-  }) => Promise<{ ok: boolean }> },
+  subagents: { prompt: (request: SubagentPromptRequest) => Promise<{ ok: boolean }> },
   address: Extract<SubagentAddress, { mode: 'continuable' }>,
   text: string,
 ): Promise<boolean> {
@@ -638,7 +584,8 @@ export async function sendPrompt(
     const response = await subagents.prompt({
       requestId: crypto.randomUUID() as SubagentPromptRequestId,
       ...address,
-      content: [{ type: 'text', text }] satisfies readonly ContentBlock[],
+      delivery: 'queue',
+      content: [{ type: 'text', text }],
     })
     return response.ok === true
   } catch {

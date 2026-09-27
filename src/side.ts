@@ -14,7 +14,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {
   ContinuableStart,
   ContinuableStartSpec,
-  SubagentListEntry,
+  SubagentCatalogEntry,
   SubagentRun,
   SubagentStartRequest,
 } from '@deepseek-ai/dsh-subagent'
@@ -25,7 +25,7 @@ import { SIDE_BOUNDARY_PROMPT, SIDE_MODE_LINE, type SideMode } from './prompts.t
 export interface SubagentsLike {
   start(name: string, request: SubagentStartRequest): Promise<SubagentRun>
   startContinuable(spec: ContinuableStartSpec): Promise<ContinuableStart>
-  listChildren(parentSessionId: SessionId, signal?: AbortSignal): Promise<SubagentListEntry[]>
+  listChildren(parentSessionId: SessionId, signal?: AbortSignal): Promise<SubagentCatalogEntry[]>
   getProvider(name: string): { readonly name: string } | undefined
 }
 
@@ -128,17 +128,17 @@ export function truncateLabel(text: string): string {
 }
 
 /** Render the direct-child catalog as readable lines for `/side list`. */
-export function formatSideList(entries: readonly SubagentListEntry[]): string {
+export function formatSideList(entries: readonly SubagentCatalogEntry[]): string {
   if (entries.length === 0) {
     return 'No side conversations yet. Start one with /side <question>.'
   }
   const lines = entries.map((entry) => {
-    if (entry.kind === 'diagnostic') {
-      return `- [unavailable] ${entry.id} (${entry.reason})`
+    if (entry.mode === 'unknown') {
+      return `- [?] ${entry.label ?? entry.id} — ${entry.id}`
     }
     const mode = entry.mode === 'continuable' ? 'side' : 'btw'
     const label = entry.mode === 'continuable' ? entry.label : (entry.label ?? '(one-shot)')
-    return `- [${mode}/${entry.activity}] ${label} — ${entry.id}`
+    return `- [${mode}] ${label} — ${entry.id}`
   })
   return lines.join('\n')
 }
